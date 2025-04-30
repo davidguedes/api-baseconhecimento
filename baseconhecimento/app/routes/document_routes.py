@@ -1,0 +1,112 @@
+import os
+from flask import Blueprint, request, jsonify
+from app.services.document_service import DocumentService
+from werkzeug.utils import secure_filename
+
+document_blueprint = Blueprint('document', __name__)
+document_service = DocumentService()
+
+# Configuração para uploads
+ALLOWED_EXTENSIONS = {'pdf'}
+
+def allowed_file(filename):
+    return '.' in filename and \
+        filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# Endpoint para upload de PDF
+@document_blueprint.route('/api/documents/upload-pdf', methods=['POST'])
+def upload_pdf():
+    if 'file' not in request.files:
+        return jsonify({'error': 'Nenhum arquivo enviado'}), 400
+    
+    file = request.files['file']
+    sector = request.form.get('sector')
+    
+    # Novo campo para receber o setor
+    if not sector:
+        return jsonify({'error': 'Setor não informado'}), 400
+
+    if file.filename == '':
+        return jsonify({'error': 'Nenhum arquivo selecionado'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file_content = file.read()
+        
+        # Processa o PDF
+        result = document_service.process_pdf(file_content, filename, sector)
+        
+        if result["status"] == "success":
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 500
+    
+    return jsonify({'error': 'Tipo de arquivo não permitido'}), 400
+
+@document_blueprint.route('/api/documents/<sector>', methods=['GET'])
+def list_documents(sector):
+    if not sector:
+        return jsonify({'error': 'Setor não informado'}), 400
+    
+    documents = document_service.list_documents(sector=sector)
+    #return jsonify(documents)
+    return documents
+
+#@document_blueprint.route('/api/documents/<sector>/<filename>', methods=['DELETE'])
+@document_blueprint.route('/api/documents/<sector>/<document_id>', methods=['DELETE'])
+#def delete_document(sector, filename):
+def delete_document(sector, document_id):
+    if not document_id or not sector:
+        return jsonify({'error': 'ID do documento e setor são obrigatórios'}), 400
+
+    #result = document_service.delete_document(sector, filename)
+    #if result["status"] == "success":
+    #    return jsonify(result), 200
+    #return jsonify(result), 404
+    result = document_service.delete_document(sector, document_id)
+    
+    return result
+
+@document_blueprint.route('/api/documents/images', methods=['GET'])
+def list_sector_images():
+    """Lista todas as imagens disponíveis para um setor"""
+    sector = request.args.get('sector')
+    
+    if not sector:
+        return jsonify({'error': 'Setor não informado'}), 400
+    
+    try:
+        # Diretório de imagens do setor
+        image_dir = os.path.join("images", sector)
+        
+        if not os.path.exists(image_dir):
+            return jsonify({
+                'status': 'success',
+                'images': [],
+                'message': 'Nenhuma imagem encontrada para este setor'
+            }), 200
+        
+        # Listar arquivos de imagem
+        image_files = []
+        for root, _, files in os.walk(image_dir):
+            for file in files:
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, "images")
+                    image_files.append({
+                        'name': file,
+                        'path': rel_path,
+                        'url': f'/api/images/{rel_path}'
+                    })
+        
+        return jsonify({
+            'status': 'success',
+            'images': image_files,
+            'count': len(image_files)
+        }), 200
+    
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Erro ao listar imagens: {str(e)}'
+        }), 500
