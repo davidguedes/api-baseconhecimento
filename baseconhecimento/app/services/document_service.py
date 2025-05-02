@@ -1,11 +1,21 @@
+
+"""
+Sistema de Base de Conhecimento Corporativa
+
+Este módulo implementa um sistema para processamento e armazenamento
+de documentos por setor, com suporte para análise multimodal (texto, imagens, tabelas).
+"""
+
 import os
 import tempfile
+import logging
 
 from flask import jsonify
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 from config.settings import Config
-from typing import List, Dict
+from typing import List, Dict, Optional
+from datetime import datetime
 
 from langchain_ollama import OllamaEmbeddings
 from langchain_ollama import ChatOllama
@@ -18,46 +28,189 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
-class DocumentService:
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class DocumentRepository:
+    """
+    Classe responsável por gerenciar o acesso ao banco de dados vetorial.
+    Implementa o padrão de repositório para abstrair o acesso ao ChromaDB.
+    """
     def __init__(self, persist_directory=Config.CHROMA_DIRECTORY):
         self.persist_directory = persist_directory
         self.embeddings = OllamaEmbeddings(model=Config.MODEL_NAME)
-        #self.ensure_persist_directory()
-        #self.vectorstore = self._initialize_vectorstore()
-
-        self.vectorstore = Chroma(
-            collection_name='multi_modal_rag',
-            persist_directory=self.persist_directory,
+    
+    def get_vectorstore(self, sector: str) -> Chroma:
+        """Retorna uma instância do ChromaDB para o setor especificado"""
+        sector_persist_dir = os.path.join(self.persist_directory, sector)
+        os.makedirs(sector_persist_dir, exist_ok=True)
+        
+        return Chroma(
+            collection_name=f'sector_{sector}',
+            persist_directory=sector_persist_dir,
             embedding_function=self.embeddings
         )
-        
-        self.llm = ChatOllama(
-            model=Config.MODEL_NAME,
-            temperature=0.1
-        )
-
-        self.vision_model = OllamaLLM(
-            model=Config.VISION_MODEL_NAME
-            #num_gpu=1,  # Limitar uso de GPU
-            #num_thread=4  # Limitar threads de CPU
-        )
     
-    def ensure_persist_directory(self):
-        if not os.path.exists(self.persist_directory):
-            os.makedirs(self.persist_directory)
+    def add_documents(self, sector: str, documents: List[Document]) -> List[str]:
+        """Adiciona documentos ao ChromaDB e retorna os IDs"""
+        vectorstore = self.get_vectorstore(sector)
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=Config.CHUNK_SIZE,
+            chunk_overlap=Config.CHUNK_OVERLAP
+        )
+        
+        split_docs = text_splitter.split_documents(documents)
+        
+        # Processa em lotes para evitar sobrecarga de memória
+        ids = []
+        batch_size = Config.EMBEDDING_BATCH_SIZE
+        for i in range(0, len(split_docs), batch_size):
+            batch = split_docs[i:i + batch_size]
+            batch_ids = vectorstore.add_documents(batch)
+            ids.extend(batch_ids)
+        
+        return ids
+    
+    def get_documents_by_source(self, sector: str, source: str) -> Tuple[List[Dict], List[str]]:
+        """Recupera todos os documentos com a origem especificada"""
+        vectorstore = self.get_vectorstore(sector)
+        collection = vectorstore._collection
+        
+        # Obter todos os metadados e IDs
+        result = collection.get()
+        metadatas = result["metadatas"]
+        ids = result["ids"]
+        
+        matching_docs = []
+        matching_ids = []
+        
+        for i, metadata in enumerate(metadatas):
+            if metadata and metadata.get("source") == source:
+                doc_info = {
+                    "id": ids[i],
+                    "source": metadata.get("source", "Unknown"),
+                    "sector": metadata.get("sector", sector),
+                    "type": metadata.get("type", "Unknown"),
+                    "upload_date": metadata.get("upload_date", "Unknown"),
+                    "file_type": metadata.get("format", "Unknown")
+                }
+                matching_docs.append(doc_info)
+                matching_ids.append(ids[i])
+                
+        return matching_docs, matching_ids
+    
+    def delete_documents_by_ids(self, sector: str, doc_ids: List[str]) -> None:
+        """Remove documentos pelos IDs"""
+        vectorstore = self.get_vectorstore(sector)
+        vectorstore.delete(doc_ids)
+    
+    def delete_documents_by_source(self, sector: str, source: str) -> int:
+        """Remove todos os documentos com a origem especificada e retorna o número de documentos removidos"""
+        _, doc_ids = self.get_documents_by_source(sector, source)
+        
+        if doc_ids:
+            self.delete_documents_by_ids(sector, doc_ids)
+            
+        return len(doc_ids)
+    
+    def list_unique_sources(self, sector: str) -> List[Dict]:
+        """Lista fontes únicas (arquivos) no setor, agrupando por nome de arquivo"""
+        vectorstore = self.get_vectorstore(sector)
+        collection = vectorstore._collection
+        
+        # Obter todos os metadados
+        result = collection.get()
+        metadatas = result["metadatas"]
+        
+        # Usar um dicionário para armazenar informações únicas por fonte
+        unique_sources = {}
+        
+        for metadata in metadatas:
+            if not metadata:
+                continue
+                
+            source = metadata.get("source")
+            if not source:
+                continue
+                
+            # Se a fonte já existe, apenas atualiza a contagem
+            if source in unique_sources:
+                unique_sources[source]["chunk_count"] += 1
+                
+                # Registrar diferentes tipos de conteúdo
+                content_type = metadata.get("type", "unknown")
+                if content_type not in unique_sources[source]["content_types"]:
+                    unique_sources[source]["content_types"].append(content_type)
+            else:
+                # Criar nova entrada para esta fonte
+                unique_sources[source] = {
+                    "source": source,
+                    "sector": metadata.get("sector", sector),
+                    "format": metadata.get("format", "Unknown"),
+                    "upload_date": metadata.get("upload_date", "Unknown"),
+                    "chunk_count": 1,
+                    "content_types": [metadata.get("type", "unknown")]
+                }
+        
+        # Converter o dicionário para uma lista
+        return list(unique_sources.values())
 
-        # Cria diretório para imagens se não existir
-        self.images_directory = os.path.join(self.persist_directory, 'images')
-        if not os.path.exists(self.images_directory):
-            os.makedirs(self.images_directory)
+class ImageProcessor:
+    """Classe responsável pelo processamento de imagens"""
+    def __init__(self, vision_model_name=Config.VISION_MODEL_NAME):
+        self.vision_model = OllamaLLM(
+            model=vision_model_name,
+            num_gpu=1,  # Limitar uso de GPU
+            num_thread=4  # Limitar threads de CPU
+        )
+        
+    def process_image(self, image_path: str, source: str, sector: str, page_no: int) -> Optional[Document]:
+        """Processa uma imagem e retorna um documento com a descrição da imagem"""
+        try:
+            image_llm = self.vision_model.bind(images=[image_path])
+            
+            prompt = """
+            Descreva o que você vê na imagem em português. 
+            Faça de forma simples, fácil de entender e com uma linguagem muito clara. 
+            Seja o mais descritivo possível, sem perder ou pular nenhum detalhe.
+            """
+            
+            response = image_llm.invoke(prompt)
+            
+            logger.info('Resultado da descrição: ', response)
 
-    def _initialize_vectorstore_old(self):
-        if os.path.exists(self.persist_directory):
-            return Chroma(
-                persist_directory=self.persist_directory,
-                embedding_function=self.embeddings
+            return Document(
+                page_content=response,
+                metadata={
+                    "source": source,
+                    "sector": sector,
+                    "type": "image-content",
+                    "page": page_no,
+                    "image_path": image_path,
+                    "format": "image/png",
+                    "upload_date": datetime.now().isoformat()
+                }
             )
-        return None
+        except Exception as e:
+            logger.error(f"Erro ao processar imagem: {str(e)}")
+            return None
+
+class DocumentService:
+    def __init__(
+            self, 
+            persist_directory=Config.CHROMA_DIRECTORY,
+            vision_model_name=Config.VISION_MODEL_NAME
+        ):
+        
+        self.embeddings = OllamaEmbeddings(model=Config.MODEL_NAME)
+
+        self.repository = DocumentRepository(persist_directory)
+
+        self.image_processor = ImageProcessor(vision_model_name)
 
     def _save_temp_file(self, file_content, file_name):
         temp_dir = tempfile.gettempdir()
@@ -69,11 +222,14 @@ class DocumentService:
         return temp_path
     
     def process_pdf(self, pdf_file, file_name: str, sector: str):
-        print('o setor ', sector)
+        """
+        Processa um arquivo PDF e adiciona seu conteúdo ao banco de dados vetorial.
+        
+        Inclui um ID de grupo para facilitar a exclusão e listagem por arquivo.
+        """
         # Salva o arquivo temporariamente
         temp_path = self._save_temp_file(pdf_file, file_name)
-        
-        print('temp_path: ', temp_path)
+
         try:
             # Usar docling para processamento do PDF
             input_doc_path = Path(temp_path)
@@ -97,6 +253,9 @@ class DocumentService:
             data = conv_res.document.export_to_dict()
             text = conv_res.document.export_to_text()
             
+            # Gerar um timestamp de upload para agrupar documentos
+            upload_date = datetime.now().isoformat()
+
             # Preparar documentos para vetorização
             documents = []
             
@@ -107,7 +266,8 @@ class DocumentService:
                     "source": file_name,
                     "sector": sector,
                     "type": "text-content",
-                    "format": "pdf"
+                    "format": "pdf",
+                    "upload_date": upload_date
                 }
             )
             documents.append(text_doc)
@@ -115,64 +275,40 @@ class DocumentService:
             # Processar imagens com o modelo de visão
             pics = data.get("pictures", [])
             page_nums = []
+
             for pic in pics:
                 if "prov" in pic and pic["prov"] and "page_no" in pic["prov"][0]:
                     page_nums.append(pic["prov"][0]["page_no"])
             
             page_nums = sorted(list(set(page_nums)))
             doc_filename = conv_res.input.file.stem
-            
+            image_docs_count = 0
             #print(f"Processando {len(page_nums)} páginas com imagens no documento {doc_filename}")
             
             for page_no, page in conv_res.document.pages.items():
                 page_no = page.page_no
                 if page_no in page_nums:
-                    print(f"Processando página {page_no}")
+                    logger.info(f"Processando página {page_no}")
                     
                     # Salvar imagem da página
                     image_path = f"{output_dir}/{doc_filename}-page-{page_no}.png"
                     with open(image_path, "wb") as f:
                         page.image.pil_image.save(f, format="PNG")
                     
-                    # Usar o modelo de visão para obter descrição da imagem
-                    try:
-                        # Adaptar para usar o modelo Ollama com visão
-                        image_llm = self.vision_model.bind(images=[image_path])
-                        
-                        # Prompt para descrição de imagem
-                        prompt_old = """
-                        Descreva em português em detalhes o que você vê nesta imagem extraída de um documento PDF. 
-                        Inclua todos os elementos visuais importantes, textos visíveis, gráficos, tabelas e qualquer outro conteúdo relevante. 
-                        Seja objetivo, claro e detalhado, priorizando informações que possam ser úteis no contexto profissional.
-                        """
-                        prompt = """
-                        Descreva o que você vê na imagem em português. Faça de forma simples, fácil de entender e com uma linguagem muito clara. Seja o mais descritivo possível, sem perder ou pular nenhum detalhe.
-                        """
-                        
-                        # Obter descrição da imagem
-                        response = image_llm.invoke(prompt)
-                        
-                        #print('descrição: ', response)
-
-                        # Criar documento com a descrição da imagem
-                        image_doc = Document(
-                            page_content=response,
-                            metadata={
-                                "source": file_name,
-                                "sector": sector,
-                                "type": "image-content",
-                                "page": page_no,
-                                "image_path": image_path,
-                                "format": "image/png"
-                            }
-                        )
+                    # Processar imagem
+                    image_doc = self.image_processor.process_image(
+                        image_path, file_name, sector, page_no
+                    )
+                    
+                    if image_doc:
                         documents.append(image_doc)
-                        print(f"Imagem da página {page_no} processada com sucesso")
-                    except Exception as img_error:
-                        print(f"Erro ao processar imagem da página {page_no}: {str(img_error)}")
+                        image_docs_count += 1
+                        logger.info(f"Imagem da página {page_no} processada com sucesso")
 
             # Extrair tabelas e elementos estruturados
             tables = data.get("tables", [])
+            table_docs_count = 0
+
             for i, table in enumerate(tables):
                 table_content = str(table.get("content", ""))
                 table_doc = Document(
@@ -182,41 +318,21 @@ class DocumentService:
                         "sector": sector,
                         "type": "table-content",
                         "table_index": i,
-                        "format": "text/table"
+                        "format": "text/table",
+                        "upload_date": upload_date
                     }
                 )
                 documents.append(table_doc)
+                table_docs_count += 1
 
-            # Configurar o vector store por setor
-            sector_persist_dir = os.path.join(self.persist_directory, sector)
-            os.makedirs(sector_persist_dir, exist_ok=True)
-            
-            vectorstore = Chroma(
-                collection_name=f'sector_{sector}',
-                persist_directory=sector_persist_dir,
-                embedding_function=self.embeddings
-            )
-            
-            #print(f"Carregando collection: sector_{sector}")
-            #print(f"Diretório: {os.path.join(self.persist_directory, sector)}")
-            #print(f"Documentos presentes: {len(vectorstore.get()['documents'])}")
-
-            st=RecursiveCharacterTextSplitter(chunk_size=2000,chunk_overlap=50)
-            sd=st.split_documents(documents)
-            
-            batch_size = 10
-            for i in range(0, len(sd), batch_size):
-                batch = sd[i:i + batch_size]
-                vectorstore.add_documents(batch)
-
-            # Adicionar documentos ao vectorstore
-            #vectorstore.add_documents(sd)
+            # Adicionar documentos ao repositório
+            self.repository.add_documents(sector, documents)
             
             # Preparar estatísticas para resposta
             stats = {
-                "text_docs": sum(1 for doc in documents if doc.metadata.get("type") == "text-content"),
-                "image_docs": sum(1 for doc in documents if "image" in doc.metadata.get("type", "")),
-                "table_docs": sum(1 for doc in documents if doc.metadata.get("type") == "table-content"),
+                "text_docs": 1,  # Temos sempre um documento de texto principal
+                "image_docs": image_docs_count,
+                "table_docs": table_docs_count,
             }
             
             return {
@@ -228,7 +344,7 @@ class DocumentService:
             }
             
         except Exception as e:
-            print(f"Erro ao processar PDF: {str(e)}")
+            logger.error(f"Erro ao processar PDF: {str(e)}")
             return {
                 "status": "error",
                 "message": f"Erro ao processar PDF: {str(e)}"
@@ -238,150 +354,30 @@ class DocumentService:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
     
-    def list_documents_atual(self, sector: str) -> List[Dict]:
-        print('vem aqui ó')
-        vectorstore = Chroma(
-                collection_name=sector,
-                persist_directory=self.persist_directory,
-                embedding_function=self.embeddings
-            )
-        
-        print('o vectorstore', vectorstore)
-
-        if not vectorstore:
-            return []
-        
-        # Obtém todos os documentos do Chroma
-        collection = vectorstore._collection
-        documents = collection.get()
-        
-        print('os documentos: ', documents)
-
-        # Agrupa documentos por fonte (arquivo original)
-        doc_dict = {}
-        for i, doc in enumerate(documents['documents']):
-            source = documents['metadatas'][i].get('source', 'Unknown')
-            if source not in doc_dict:
-                doc_dict[source] = {
-                    'id': documents['ids'][i],
-                    'filename': source,
-                    'chunks': 1,
-                    'created_at': documents['metadatas'][i].get('created_at', 'Unknown')
-                }
-            else:
-                doc_dict[source]['chunks'] += 1
-
-        print(doc_dict.values())
-        return list(doc_dict.values())
-
-    def delete_document_atual(self, sector: str, filename: str) -> Dict:
+    def list_documents(self, sector: str):
+        """Lista documentos únicos do setor (agrupados por arquivo)"""
         try:
-            vectorstore = Chroma(
-                collection_name=sector,
-                persist_directory=self.persist_directory,
-                embedding_function=self.embeddings
-            )
-
-            if not vectorstore:
-                return {"status": "error", "message": "Nenhum documento encontrado"}
-
-            # Obtém IDs dos documentos com o filename especificado
-            collection = vectorstore._collection
-            documents = collection.get()
+            unique_docs = self.repository.list_unique_sources(sector)
             
-            # Lista para armazenar IDs a serem deletados e caminhos de imagens
-            ids_to_delete = []
-            image_paths = []
-            
-            # Itera sobre documentos e coleta IDs e caminhos de imagens
-            for doc_id, metadata in zip(documents['ids'], documents['metadatas']):
-                if metadata.get('source') == filename:
-                    ids_to_delete.append(doc_id)
-                    
-                    # Se for uma imagem, adiciona o caminho para remoção
-                    if metadata.get('content_type') == 'image' and metadata.get('image_path'):
-                        image_paths.append(metadata['image_path'])
+            return jsonify(unique_docs), 200
 
-            if not ids_to_delete:
-                return {"status": "error", "message": f"Documento {filename} não encontrado"}
-
-            # Remove os documentos
-            collection.delete(ids_to_delete)
-            vectorstore.persist()
-
-            # Remove os arquivos de imagem
-            removed_images = 0
-            for image_path in image_paths:
-                try:
-                    if os.path.exists(image_path):
-                        os.remove(image_path)
-                        removed_images += 1
-                except Exception as img_e:
-                    print(f"Erro ao remover imagem {image_path}: {str(img_e)}")
-
-            return {
-                "status": "success",
-                "message": f"Documento {filename} removido com sucesso. {removed_images} imagens removidas.",
-                "removed_documents": len(ids_to_delete),
-                "removed_images": removed_images
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Erro ao remover documento: {str(e)}"
-            }
-        
-    def currentDate(self):
-        from datetime import date
-
-        dia = date.today()
-        dia = dia.strftime('%d/%m/%y')
-        return dia
-    
-    def list_documents(self, sector: str) -> List[Dict]:
-        try:
-            # Implementação depende de como você está armazenando os metadados dos documentos
-            # Exemplo usando Chroma diretamente:
-            vectorstore = Chroma(
-                collection_name=f'sector_{sector}',
-                persist_directory=os.path.join(self.persist_directory, sector),
-                embedding_function=self.embeddings
-            )
-            
-            # Obter os metadados de todos os documentos
-            collection = vectorstore._collection
-            metadatas = collection.get()["metadatas"]
-            ids = collection.get()["ids"]
-            
-            documents_info = []
-            for i, metadata in enumerate(metadatas):
-                if metadata:  # Alguns metadados podem ser None
-                    doc_info = {
-                        "id": ids[i],
-                        "source": metadata.get("source", "Unknown"),
-                        "sector": metadata.get("sector", sector),
-                        "type": metadata.get("type", "Unknown")
-                    }
-                    documents_info.append(doc_info)
-            
-            return jsonify(documents_info), 200
+            """return jsonify({
+                "status": "success", 
+                "count": len(unique_docs),
+                "documents": unique_docs
+            }), 200"""
             
         except Exception as e:
+            logger.error(f"Erro ao listar documentos: {str(e)}")
             return jsonify({
                 "status": "error",
                 "message": f"Erro ao listar documentos: {str(e)}"
             }), 500
-    
-    def delete_document(self, sector: str, document_id: str) -> Dict:
+
+    def delete_document_by_id(self, sector: str, document_id: str):
+        """Remove um único documento pelo ID"""
         try:
-            vectorstore = Chroma(
-                collection_name=f'sector_{sector}',
-                persist_directory=os.path.join(self.persist_directory, sector),
-                embedding_function=self.embeddings
-            )
-            
-            # Remover documento pelo ID
-            vectorstore.delete([document_id])
+            self.repository.delete_documents_by_ids(sector, [document_id])
             
             return jsonify({
                 "status": "success",
@@ -389,6 +385,24 @@ class DocumentService:
             }), 200
             
         except Exception as e:
+            logger.error(f"Erro ao remover documento: {str(e)}")
+            return jsonify({
+                "status": "error",
+                "message": f"Erro ao remover documento: {str(e)}"
+            }), 500
+    
+    def delete_document_by_source(self, sector: str, source: str):
+        """Remove todos os documentos relacionados a um arquivo específico"""
+        try:
+            count = self.repository.delete_documents_by_source(sector, source)
+            
+            return jsonify({
+                "status": "success",
+                "message": f"Documento {source} e todos os seus {count} fragmentos foram removidos com sucesso"
+            }), 200
+            
+        except Exception as e:
+            logger.error(f"Erro ao remover documento: {str(e)}")
             return jsonify({
                 "status": "error",
                 "message": f"Erro ao remover documento: {str(e)}"

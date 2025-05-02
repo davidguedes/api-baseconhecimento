@@ -48,24 +48,27 @@ def list_documents(sector):
     if not sector:
         return jsonify({'error': 'Setor não informado'}), 400
     
-    documents = document_service.list_documents(sector=sector)
-    #return jsonify(documents)
-    return documents
+    return document_service.list_documents(sector=sector)
 
-#@document_blueprint.route('/api/documents/<sector>/<filename>', methods=['DELETE'])
 @document_blueprint.route('/api/documents/<sector>/<document_id>', methods=['DELETE'])
-#def delete_document(sector, filename):
 def delete_document(sector, document_id):
-    if not document_id or not sector:
-        return jsonify({'error': 'ID do documento e setor são obrigatórios'}), 400
-
-    #result = document_service.delete_document(sector, filename)
-    #if result["status"] == "success":
-    #    return jsonify(result), 200
-    #return jsonify(result), 404
-    result = document_service.delete_document(sector, document_id)
+        if not sector:
+            return jsonify({'error': 'Setor não informado'}), 400
+            
+        if not document_id:
+            return jsonify({'error': 'ID do documento não informado'}), 400
+            
+        return document_service.delete_document_by_id(sector, document_id)
     
-    return result
+@document_blueprint.route('/api/documents/<sector>/source/<source>', methods=['DELETE'])
+def delete_document_by_source(sector, source):
+    if not sector:
+        return jsonify({'error': 'Setor não informado'}), 400
+        
+    if not source:
+        return jsonify({'error': 'Nome do arquivo não informado'}), 400
+        
+    return document_service.delete_document_by_source(sector, source)
 
 @document_blueprint.route('/api/documents/images', methods=['GET'])
 def list_sector_images():

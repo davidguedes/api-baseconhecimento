@@ -215,7 +215,7 @@ class AIService:
                     "images": []
                 }
             
-            print(docs)
+            print('relevantes: ', docs)
 
             # Extrair caminhos de imagens relevantes
             images = []

@@ -7,3 +7,6 @@ class Config:
     #VISION_MODEL_NAME = 'gemma3:27b'
     #VISION_MODEL_NAME = 'gemma3:12b'
     #VISION_MODEL_NAME = 'llama3.2-vision'
+    CHUNK_SIZE = 2000
+    CHUNK_OVERLAP = 50
+    EMBEDDING_BATCH_SIZE = 10
