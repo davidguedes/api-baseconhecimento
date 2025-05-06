@@ -18,7 +18,6 @@ from typing import List, Dict, Optional
 from datetime import datetime
 
 from langchain_ollama import OllamaEmbeddings
-from langchain_ollama import ChatOllama
 from langchain_ollama import OllamaLLM
 from langchain_chroma import Chroma
 from langchain.schema.document import Document
@@ -181,7 +180,7 @@ class ImageProcessor:
             
             response = image_llm.invoke(prompt)
             
-            logger.info('Resultado da descrição: ', response)
+            logger.info(f"Resultado da descrição: {response}")
 
             return Document(
                 page_content=response,
