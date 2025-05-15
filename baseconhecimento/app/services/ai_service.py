@@ -175,7 +175,14 @@ class AIService:
 
             # Configurar retriever
             retriever = vectorstore.as_retriever(
-                search_type="similarity",
+                #search_type="mmr",  # Maximal Marginal Relevance para melhor diversidade nos resultados
+                #search_kwargs={
+                #    "k": 5,  # Aumentando para 5 documentos (ajuste conforme necessário)
+                #    "fetch_k": 20,  # Buscar mais documentos antes de filtrar
+                #    "lambda_mult": 0.7,  # Balanceamento entre relevância e diversidade
+                #    "filter": None  # Sem filtros por enquanto, mas útil para diagnóstico
+                #}
+                #search_type="similarity",
                 search_kwargs={"k": 3}
             )
 
@@ -200,7 +207,7 @@ class AIService:
             input_variables=["setor", "contexto", "pergunta"],
             template=self.template_rag_sector,
         )
-        
+
         try:
             # Recuperar documentos relevantes
             docs = self.retriever.invoke(message)

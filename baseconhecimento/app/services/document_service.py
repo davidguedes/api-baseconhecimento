@@ -18,7 +18,6 @@ from typing import List, Dict, Optional
 from datetime import datetime
 
 from langchain_ollama import OllamaEmbeddings
-from langchain_ollama import ChatOllama
 from langchain_ollama import OllamaLLM
 from langchain_chroma import Chroma
 from langchain.schema.document import Document
@@ -62,6 +61,8 @@ class DocumentRepository:
             chunk_size=Config.CHUNK_SIZE,
             chunk_overlap=Config.CHUNK_OVERLAP
         )
+
+        print('Documentos: ', documents)
         
         split_docs = text_splitter.split_documents(documents)
         
@@ -177,6 +178,7 @@ class ImageProcessor:
             Descreva o que você vê na imagem em português. 
             Faça de forma simples, fácil de entender e com uma linguagem muito clara. 
             Seja o mais descritivo possível, sem perder ou pular nenhum detalhe.
+            Não retorne junto a descrição saudações ou cumprimentos.
             """
             
             response = image_llm.invoke(prompt)
@@ -252,6 +254,10 @@ class DocumentService:
             conv_res = doc_converter.convert(input_doc_path)
             data = conv_res.document.export_to_dict()
             text = conv_res.document.export_to_text()
+
+            # Normalizar e limpar o texto português
+            text = self._normalize_portuguese_text(text)
+            #text = self._clean_extracted_text(text)
             
             # Gerar um timestamp de upload para agrupar documentos
             upload_date = datetime.now().isoformat()
@@ -270,8 +276,11 @@ class DocumentService:
                     "upload_date": upload_date
                 }
             )
-            documents.append(text_doc)
+            if(text_doc != ''):
+                documents.append(text_doc)
             
+            print(text_doc)
+
             # Processar imagens com o modelo de visão
             pics = data.get("pictures", [])
             page_nums = []
@@ -311,6 +320,9 @@ class DocumentService:
 
             for i, table in enumerate(tables):
                 table_content = str(table.get("content", ""))
+                if(table_content == ''):
+                    continue
+
                 table_doc = Document(
                     page_content=table_content,
                     metadata={
@@ -407,3 +419,40 @@ class DocumentService:
                 "status": "error",
                 "message": f"Erro ao remover documento: {str(e)}"
             }), 500
+        
+    def _normalize_portuguese_text(self, text):
+        """Normaliza o texto em português para corrigir problemas comuns de encoding"""
+        # Correções comuns para problemas de encoding em português
+        replacements = {
+            'Ã£': 'ã', 'Ã¡': 'á', 'Ã©': 'é', 'Ãª': 'ê', 'Ã§': 'ç',
+            'Ã³': 'ó', 'Ãµ': 'õ', 'Ã­': 'í', 'Ãº': 'ú',
+            'Ã‰': 'É', 'Ãƒ': 'Ã', 'Ã‡': 'Ç', 'Ã"': 'Ó', 'Ãš': 'Ú',
+            'Ø': 'é', 'ª' : 'ã', 'Æ': 'á', '€': 'e'
+        }
+        
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        
+        # Normalização Unicode
+        import unicodedata
+        text = unicodedata.normalize('NFC', text)
+        
+        return text
+
+    def _clean_extracted_text(self, text):
+        """Limpa e corrige problemas comuns após extração"""
+        import re
+        
+        # Remove caracteres de controle
+        text = re.sub(r'[\x00-\x1F\x7F]', '', text)
+        
+        # Corrige espaçamentos duplos
+        text = re.sub(r' +', ' ', text)
+        
+        # Corrige quebras de linha excessivas
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Corrige problemas comuns com hífens em português
+        text = re.sub(r'(?<=\w)- (?=\w)', '', text)  # Remove hífens desnecessários
+        
+        return text
