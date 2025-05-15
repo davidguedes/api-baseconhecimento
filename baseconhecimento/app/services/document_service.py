@@ -183,7 +183,7 @@ class ImageProcessor:
             
             response = image_llm.invoke(prompt)
             
-            logger.info('Resultado da descrição: ', response)
+            logger.info(f"Resultado da descrição: {response}")
 
             return Document(
                 page_content=response,
