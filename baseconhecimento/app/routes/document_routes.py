@@ -7,7 +7,7 @@ document_blueprint = Blueprint('document', __name__)
 document_service = DocumentService()
 
 # Configuração para uploads
-ALLOWED_EXTENSIONS = {'pdf'}
+ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'}
 
 def allowed_file(filename):
     return '.' in filename and \

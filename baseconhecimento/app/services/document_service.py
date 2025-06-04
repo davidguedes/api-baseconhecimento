@@ -26,6 +26,15 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+
+import cv2
+import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
+import re
+
+from spellchecker import SpellChecker
+import language_tool_python
 
 # Configuração de logging
 logging.basicConfig(
@@ -214,6 +223,11 @@ class DocumentService:
 
         self.image_processor = ImageProcessor(vision_model_name)
 
+        # Inicializar corretor ortográfico para português
+        self.spell_checker = SpellChecker(language='pt')
+        
+        self.language_tool = None  # Inicializar apenas quando necessário
+
     def _save_temp_file(self, file_content, file_name):
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, file_name)
@@ -225,63 +239,68 @@ class DocumentService:
     
     def process_pdf(self, pdf_file, file_name: str, sector: str):
         """
-        Processa um arquivo PDF e adiciona seu conteúdo ao banco de dados vetorial.
+        Processa um arquivo PDF com melhorias na extração de texto e qualidade do OCR.
         
-        Inclui um ID de grupo para facilitar a exclusão e listagem por arquivo.
+        Inclui pré-processamento de imagens, múltiplas tentativas de OCR e 
+        pós-processamento de texto para melhor qualidade.
         """
+        
         # Salva o arquivo temporariamente
         temp_path = self._save_temp_file(pdf_file, file_name)
 
         try:
-            # Usar docling para processamento do PDF
+            # Usar docling para processamento do PDF com configurações otimizadas
             input_doc_path = Path(temp_path)
             output_dir = Path(f"./images/{sector}")
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Configuração do docling
+            # Configuração otimizada do docling para melhor OCR
             pipeline_options = PdfPipelineOptions()
-            pipeline_options.images_scale=2.0
-            pipeline_options.generate_page_images=True
-            pipeline_options.generate_picture_images=True
+            pipeline_options.ocr_options.lang = ["pt"]  # Português brasileiro e português
+            pipeline_options.images_scale = 3.0  # Aumentar escala para melhor OCR
+            pipeline_options.generate_page_images = True
+            pipeline_options.generate_picture_images = True
             
             doc_converter = DocumentConverter(
                 format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=pipeline_options,
+                        backend=PyPdfiumDocumentBackend,
+                    )
                 }
             )
             
             # Converter o documento
             conv_res = doc_converter.convert(input_doc_path)
             data = conv_res.document.export_to_dict()
-            text = conv_res.document.export_to_text()
+            raw_text = conv_res.document.export_to_text()
 
-            # Normalizar e limpar o texto português
-            text = self._normalize_portuguese_text(text)
-            #text = self._clean_extracted_text(text)
-            
+            # Pós-processamento do texto extraído
+            processed_text = self._post_process_text(raw_text)
+
             # Gerar um timestamp de upload para agrupar documentos
             upload_date = datetime.now().isoformat()
 
             # Preparar documentos para vetorização
             documents = []
             
-            # Adicionar conteúdo de texto
-            text_doc = Document(
-                page_content=text,
-                metadata={
-                    "source": file_name,
-                    "sector": sector,
-                    "type": "text-content",
-                    "format": "pdf",
-                    "upload_date": upload_date
-                }
-            )
-            if(text_doc != ''):
+            # Adicionar conteúdo de texto processado
+            if processed_text and processed_text.strip():
+                text_doc = Document(
+                    page_content=processed_text,
+                    metadata={
+                        "source": file_name,
+                        "sector": sector,
+                        "type": "text-content",
+                        "format": "pdf",
+                        "upload_date": upload_date,
+                        "processing_quality": "enhanced"
+                    }
+                )
                 documents.append(text_doc)
-            
-            print(text_doc)
+                print(f"Texto processado extraído: {len(processed_text)} caracteres")
 
-            # Processar imagens com o modelo de visão
+            # Processar imagens com melhorias
             pics = data.get("pictures", [])
             page_nums = []
 
@@ -292,21 +311,22 @@ class DocumentService:
             page_nums = sorted(list(set(page_nums)))
             doc_filename = conv_res.input.file.stem
             image_docs_count = 0
-            #print(f"Processando {len(page_nums)} páginas com imagens no documento {doc_filename}")
             
             for page_no, page in conv_res.document.pages.items():
                 page_no = page.page_no
                 if page_no in page_nums:
-                    logger.info(f"Processando página {page_no}")
+                    logger.info(f"Processando página {page_no} com melhorias de imagem")
                     
-                    # Salvar imagem da página
+                    # Melhorar qualidade da imagem antes de salvar
+                    enhanced_image = self._enhance_image_for_ocr(page.image.pil_image)
+                    
+                    # Salvar imagem melhorada
                     image_path = f"{output_dir}/{doc_filename}-page-{page_no}.png"
-                    with open(image_path, "wb") as f:
-                        page.image.pil_image.save(f, format="PNG")
+                    enhanced_image.save(image_path, format="PNG", dpi=(300, 300))
                     
-                    # Processar imagem
-                    image_doc = self.image_processor.process_image(
-                        image_path, file_name, sector, page_no
+                    # Processar imagem com OCR adicional se necessário
+                    image_doc = self._process_image_with_fallback_ocr(
+                        image_path, enhanced_image, file_name, sector, page_no
                     )
                     
                     if image_doc:
@@ -314,24 +334,28 @@ class DocumentService:
                         image_docs_count += 1
                         logger.info(f"Imagem da página {page_no} processada com sucesso")
 
-            # Extrair tabelas e elementos estruturados
+            # Extrair e processar tabelas
             tables = data.get("tables", [])
             table_docs_count = 0
 
             for i, table in enumerate(tables):
                 table_content = str(table.get("content", ""))
-                if(table_content == ''):
+                if not table_content.strip():
                     continue
 
+                # Processar conteúdo da tabela
+                processed_table_content = self._post_process_text(table_content)
+
                 table_doc = Document(
-                    page_content=table_content,
+                    page_content=processed_table_content,
                     metadata={
                         "source": file_name,
                         "sector": sector,
                         "type": "table-content",
                         "table_index": i,
                         "format": "text/table",
-                        "upload_date": upload_date
+                        "upload_date": upload_date,
+                        "processing_quality": "enhanced"
                     }
                 )
                 documents.append(table_doc)
@@ -340,12 +364,16 @@ class DocumentService:
             # Adicionar documentos ao repositório
             self.repository.add_documents(sector, documents)
             
+            print('texto processado: ', processed_text)
+
             # Preparar estatísticas para resposta
             stats = {
-                "text_docs": 1,  # Temos sempre um documento de texto principal
+                "text_docs": 1 if processed_text and processed_text.strip() else 0,
                 "image_docs": image_docs_count,
                 "table_docs": table_docs_count,
             }
+            
+            print('chegou no estagio final.')
             
             return {
                 "status": "success",
@@ -365,7 +393,212 @@ class DocumentService:
             # Limpa o arquivo temporário
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    def _enhance_image_for_ocr(self, pil_image):
+        """
+        Melhora a qualidade da imagem para melhor reconhecimento de texto.
+        """
+        # Converter PIL para OpenCV
+        img_array = np.array(pil_image)
+        if len(img_array.shape) == 3:
+            img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        else:
+            img = img_array
+        
+        # Redimensionar se muito pequena
+        height, width = img.shape[:2]
+        if height < 600 or width < 600:
+            scale_factor = max(800/height, 800/width)
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        
+        # Converter para escala de cinza
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+        
+        # Aplicar filtro de denoising
+        denoised = cv2.fastNlMeansDenoising(gray)
+        
+        # Melhorar contraste usando CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(denoised)
+        
+        # Aplicar binarização adaptativa
+        binary = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Converter de volta para PIL
+        enhanced_pil = Image.fromarray(binary)
+        
+        # Aplicar sharpening
+        enhanced_pil = enhanced_pil.filter(ImageFilter.SHARPEN)
+        
+        return enhanced_pil
+
+    def _process_image_with_fallback_ocr(self, image_path, enhanced_image, file_name, sector, page_no):
+        """
+        Processa imagem com múltiplas tentativas de OCR para melhor qualidade.
+        """
+        try:
+            # Primeiro tentar com o processador de imagem padrão
+            image_doc = self.image_processor.process_image(
+                image_path, file_name, sector, page_no
+            )
+            
+            # Se o resultado for muito curto ou com muitos erros, tentar OCR direto
+            if not image_doc or len(image_doc.page_content) < 50:
+                import pytesseract
+                
+                # Configurações otimizadas do Tesseract para português
+                custom_config = r'--oem 3 --psm 6 -l por+pt'
+                
+                # OCR na imagem melhorada
+                ocr_text = pytesseract.image_to_string(enhanced_image, config=custom_config)
+                
+                if ocr_text and len(ocr_text.strip()) > 20:
+                    processed_ocr_text = self._post_process_text(ocr_text)
+                    
+                    image_doc = Document(
+                        page_content=processed_ocr_text,
+                        metadata={
+                            "source": file_name,
+                            "sector": sector,
+                            "type": "image-content",
+                            "page_number": page_no,
+                            "format": "ocr-enhanced",
+                            "upload_date": datetime.now().isoformat(),
+                            "processing_method": "fallback_ocr"
+                        }
+                    )
+            
+            return image_doc
+        except Exception as e:
+            logger.warning(f"Erro no processamento de imagem da página {page_no}: {str(e)}")
+            return None
+
+    def _post_process_text(self, text, spelling_correction='languagetool'):
+        """
+        Pós-processa o texto extraído para corrigir erros comuns de OCR.
+        """
+        if not text:
+            return ""
+        
+        # Remover caracteres estranhos comuns em OCR
+        text = re.sub(r'[^\w\s\-.,;:!?()[\]{}\"\'@#$%&*+=<>/\\|`~]', '', text)
+        
+        # Corrigir espaçamentos múltiplos
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Corrigir quebras de linha desnecessárias
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        text = re.sub(r'(?<=[a-z])\n(?=[a-z])', ' ', text)
+        
+        # Dicionário de correções comuns em português (OCR)
+        common_corrections = {
+            r'\bl\b': 'I',  # l minúsculo sozinho geralmente é I
+            r'\bO\b': '0',  # O maiúsculo sozinho em contexto numérico
+            r'\b0\b': 'O',  # 0 em contexto de palavras
+            r'rn': 'm',     # rn é frequentemente m mal reconhecido
+            r'vv': 'w',     # vv é frequentemente w
+            r'\bao\b': 'do', # ao pode ser do
+            r'\bcla\b': 'da', # cla pode ser da
+            r'§': 'S',      # símbolo de seção confundido com S
+        }
+        
+        for pattern, replacement in common_corrections.items():
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        
+        # 5. Aplicar correção ortográfica se solicitada
+        if spelling_correction != 'none':
+            text = self._correct_with_context(text, method=spelling_correction)
+
+        # Remover linhas muito curtas que provavelmente são ruído
+        lines = text.split('\n')
+        filtered_lines = [line.strip() for line in lines if len(line.strip()) > 2]
+        
+        return '\n'.join(filtered_lines).strip()
+
+    def _initialize_language_tool(self):
+        """Inicializa o LanguageTool apenas quando necessário"""
+        print('aqui inicializando')
+        if self.language_tool is None:
+            self.language_tool = language_tool_python.LanguageTool('pt-BR')
+
+    def _correct_with_context(self, text, method='languagetool'):
+        print('O motodo é: ', method)
+
+        """Correção com diferentes níveis de contexto"""
+        if method == 'simple':
+            return self._correct_spelling_simple(text)
+        
+        elif method == 'languagetool':
+            try:
+                #self._initialize_language_tool()
+                language_tool = language_tool_python.LanguageTool('pt-BR')
+                #matches = self.language_tool.check(text)
+                matches = language_tool.check(text)
+                print('Matches: ', matches)
+                correcao = language_tool_python.utils.correct(text, matches)
+                print('A correcao: ', correcao)
+                return correcao
+            except Exception as e:
+                print('O erro: ', e)
+                return self._correct_spelling_simple(text)
+        
+        return text
     
+    def _correct_spelling_simple(self, text):
+        """Correção ortográfica simples palavra por palavra"""
+        words = re.findall(r'\b\w+\b', text)
+        corrections = {}
+        
+        spell_checker = SpellChecker(language='pt')
+        
+        print('passa aqui')
+
+        for word in words:
+            word_lower = word.lower()
+            if word_lower not in spell_checker and len(word_lower) > 2:
+                # Busca correção apenas para palavras não conhecidas
+                candidates = spell_checker.candidates(word_lower)
+                if candidates:
+                    # Pega a primeira sugestão (mais provável)
+                    best_correction = list(candidates)[0]
+                    corrections[word] = best_correction
+        
+        # Aplica as correções mantendo a capitalização original
+        corrected_text = text
+        for original, correction in corrections.items():
+            if original[0].isupper():
+                correction = correction.capitalize()
+            if original.isupper() and len(original) > 1:
+                correction = correction.upper()
+            
+            corrected_text = re.sub(r'\b' + re.escape(original) + r'\b', 
+                correction, corrected_text)
+        
+        return corrected_text
+
+    def _save_temp_file(self, pdf_file, file_name: str):
+        """
+        Salva arquivo temporário para processamento.
+        """
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"temp_{file_name}")
+        
+        with open(temp_path, "wb") as f:
+            if hasattr(pdf_file, 'read'):
+                f.write(pdf_file.read())
+            else:
+                f.write(pdf_file)
+        
+        return temp_path
+
     def list_documents(self, sector: str):
         """Lista documentos únicos do setor (agrupados por arquivo)"""
         try:
