@@ -182,7 +182,7 @@ class AIService:
                 #    "lambda_mult": 0.7,  # Balanceamento entre relevância e diversidade
                 #    "filter": None  # Sem filtros por enquanto, mas útil para diagnóstico
                 #}
-                #search_type="similarity",
+                search_type="similarity",
                 search_kwargs={"k": 3}
             )
 
