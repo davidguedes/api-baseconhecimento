@@ -36,6 +36,9 @@ import re
 
 from spellchecker import SpellChecker
 import language_tool_python
+from docling.datamodel.pipeline_options import PdfPipelineOptions, PaginatedPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption, ExcelFormatOption
+from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 
 from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice
 import torch
@@ -336,6 +339,10 @@ class DocumentService:
             processed_text = self._post_process_text(raw_text)
             #processed_text = raw_text
 
+            # Normalizar e limpar o texto português
+            #text = self._normalize_portuguese_text(text)
+            #text = self._clean_extracted_text(text)
+            
             # Gerar um timestamp de upload para agrupar documentos
             upload_date = datetime.now().isoformat()
 

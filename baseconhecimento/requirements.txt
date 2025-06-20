@@ -12,6 +12,10 @@ pydantic==2.10.5
 pydantic-settings==2.7.1
 pydantic_core==2.27.2
 python-dotenv==1.1.0
+pyspellchecker==0.8.3
+language-tool-python==2.9.4
+symspellpy==6.9.0
+pytesseract==0.3.13
 
 #pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
