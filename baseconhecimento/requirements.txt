@@ -13,6 +13,9 @@ pydantic-settings==2.7.1
 pydantic_core==2.27.2
 python-dotenv==1.1.0
 
+#pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+
 #transformers==4.46.3
 #langchainhub==0.1.21
 #pypdf==5.1.0

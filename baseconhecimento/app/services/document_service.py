@@ -9,6 +9,7 @@ de documentos por setor, com suporte para análise multimodal (texto, imagens, t
 import os
 import tempfile
 import logging
+import concurrent.futures
 
 from flask import jsonify
 from pathlib import Path
@@ -30,11 +31,16 @@ from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageFilter
 import re
 
 from spellchecker import SpellChecker
 import language_tool_python
+
+from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice
+import torch
+os.environ['TORCH_CUDA_ARCH_LIST'] = '7.5'
+from docling_core.types.doc import ImageRefMode, PictureItem, TableItem
 
 # Configuração de logging
 logging.basicConfig(
@@ -56,7 +62,7 @@ class DocumentRepository:
         """Retorna uma instância do ChromaDB para o setor especificado"""
         sector_persist_dir = os.path.join(self.persist_directory, sector)
         os.makedirs(sector_persist_dir, exist_ok=True)
-        
+
         return Chroma(
             collection_name=f'sector_{sector}',
             persist_directory=sector_persist_dir,
@@ -66,22 +72,49 @@ class DocumentRepository:
     def add_documents(self, sector: str, documents: List[Document]) -> List[str]:
         """Adiciona documentos ao ChromaDB e retorna os IDs"""
         vectorstore = self.get_vectorstore(sector)
+        
+        # Configurar splitter uma vez
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=Config.CHUNK_SIZE,
             chunk_overlap=Config.CHUNK_OVERLAP
         )
 
-        print('Documentos: ', documents)
+        print('passa por esse')
         
-        split_docs = text_splitter.split_documents(documents)
+        # Processar documentos em paralelo para splitting
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            split_futures = [
+                executor.submit(text_splitter.split_documents, [doc]) 
+                for doc in documents
+            ]
+            
+            all_split_docs = []
+            for future in concurrent.futures.as_completed(split_futures):
+                all_split_docs.extend(future.result())
         
-        # Processa em lotes para evitar sobrecarga de memória
+        print('chega nesse')
+
+        # Adicionar em batches maiores
         ids = []
-        batch_size = Config.EMBEDDING_BATCH_SIZE
-        for i in range(0, len(split_docs), batch_size):
-            batch = split_docs[i:i + batch_size]
-            batch_ids = vectorstore.add_documents(batch)
-            ids.extend(batch_ids)
+        batch_size = min(Config.EMBEDDING_BATCH_SIZE * 2, 100)  # Batch maior
+        
+        print('aqui tbm')
+
+        for i in range(0, len(all_split_docs), batch_size):
+            print('entra no for')
+            batch = all_split_docs[i:i + batch_size]
+            try:
+                batch_ids = vectorstore.add_documents(batch)
+                ids.extend(batch_ids)
+            except Exception as e:
+                logger.error(f"Erro ao adicionar batch {i//batch_size + 1}: {str(e)}")
+                # Tentar com batch menor em caso de erro
+                for doc in batch:
+                    try:
+                        doc_id = vectorstore.add_documents([doc])
+                        ids.extend(doc_id)
+                    except Exception as doc_error:
+                        logger.error(f"Erro ao adicionar documento individual: {str(doc_error)}")
         
         return ids
     
@@ -174,15 +207,16 @@ class ImageProcessor:
     def __init__(self, vision_model_name=Config.VISION_MODEL_NAME):
         self.vision_model = OllamaLLM(
             model=vision_model_name,
-            num_gpu=1,  # Limitar uso de GPU
-            num_thread=4  # Limitar threads de CPU
+            num_gpu=2,  # Limitar uso de GPU
+            num_thread=8  # Limitar threads de CPU
         )
         
     def process_image(self, image_path: str, source: str, sector: str, page_no: int) -> Optional[Document]:
         """Processa uma imagem e retorna um documento com a descrição da imagem"""
         try:
             image_llm = self.vision_model.bind(images=[image_path])
-            
+            print("Imagem vinculada com vision_model. Pronto para invocar.")
+
             prompt = """
             Descreva o que você vê na imagem em português. 
             Faça de forma simples, fácil de entender e com uma linguagem muito clara. 
@@ -191,7 +225,8 @@ class ImageProcessor:
             """
             
             response = image_llm.invoke(prompt)
-            
+            print("Resposta da LLM recebida.")
+
             logger.info(f"Resultado da descrição: {response}")
 
             return Document(
@@ -223,6 +258,12 @@ class DocumentService:
 
         self.image_processor = ImageProcessor(vision_model_name)
 
+        # Obtém a hora atual
+        self.agora = datetime.now()
+
+        # Formata a hora para exibição (opcional)
+        self.hora_formatada = self.agora.strftime("%H:%M:%S")
+
         # Inicializar corretor ortográfico para português
         self.spell_checker = SpellChecker(language='pt')
         
@@ -245,9 +286,12 @@ class DocumentService:
         pós-processamento de texto para melhor qualidade.
         """
         
+        print('Iniciando. Posição: 1')
+
         # Salva o arquivo temporariamente
         temp_path = self._save_temp_file(pdf_file, file_name)
 
+        print('Posição: 2')
         try:
             # Usar docling para processamento do PDF com configurações otimizadas
             input_doc_path = Path(temp_path)
@@ -257,10 +301,16 @@ class DocumentService:
             # Configuração otimizada do docling para melhor OCR
             pipeline_options = PdfPipelineOptions()
             pipeline_options.ocr_options.lang = ["pt"]  # Português brasileiro e português
-            pipeline_options.images_scale = 3.0  # Aumentar escala para melhor OCR
-            pipeline_options.generate_page_images = True
+            pipeline_options.images_scale = 2.0  # Aumentar escala para melhor OCR
+            pipeline_options.generate_page_images = False
             pipeline_options.generate_picture_images = True
-            
+            accelerator_options = AcceleratorOptions(
+                num_threads=8, device=AcceleratorDevice.CUDA
+            )
+            pipeline_options.accelerator_options = accelerator_options
+
+            print(f"   CUDA available: {torch.cuda.is_available()}")
+
             doc_converter = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(
@@ -270,13 +320,21 @@ class DocumentService:
                 }
             )
             
+            print(self.hora_formatada, 'Posição: 3')
+
             # Converter o documento
             conv_res = doc_converter.convert(input_doc_path)
             data = conv_res.document.export_to_dict()
+            print(self.hora_formatada, 'Posição: 3.5')
+
             raw_text = conv_res.document.export_to_text()
+
+            print('raw_text ', raw_text)
+            print(self.hora_formatada, 'Posição: 4')
 
             # Pós-processamento do texto extraído
             processed_text = self._post_process_text(raw_text)
+            #processed_text = raw_text
 
             # Gerar um timestamp de upload para agrupar documentos
             upload_date = datetime.now().isoformat()
@@ -284,6 +342,8 @@ class DocumentService:
             # Preparar documentos para vetorização
             documents = []
             
+            print(self.hora_formatada, 'Posição: 5')
+
             # Adicionar conteúdo de texto processado
             if processed_text and processed_text.strip():
                 text_doc = Document(
@@ -300,39 +360,58 @@ class DocumentService:
                 documents.append(text_doc)
                 print(f"Texto processado extraído: {len(processed_text)} caracteres")
 
-            # Processar imagens com melhorias
-            pics = data.get("pictures", [])
-            page_nums = []
-
-            for pic in pics:
-                if "prov" in pic and pic["prov"] and "page_no" in pic["prov"][0]:
-                    page_nums.append(pic["prov"][0]["page_no"])
-            
-            page_nums = sorted(list(set(page_nums)))
-            doc_filename = conv_res.input.file.stem
+            # Processar apenas as imagens extraídas
+            picture_counter = 0
             image_docs_count = 0
-            
-            for page_no, page in conv_res.document.pages.items():
-                page_no = page.page_no
-                if page_no in page_nums:
-                    logger.info(f"Processando página {page_no} com melhorias de imagem")
+
+            print(self.hora_formatada, 'Posição: 7 - processando imagens')
+
+            for element, _level in conv_res.document.iterate_items():
+                if isinstance(element, PictureItem):
+                    picture_counter += 1
                     
-                    # Melhorar qualidade da imagem antes de salvar
-                    enhanced_image = self._enhance_image_for_ocr(page.image.pil_image)
+                    # Salvar a imagem
+                    element_image_filename = output_dir / f"{file_name}-picture-{picture_counter}.png"
+                    
+                    # Obter a imagem PIL
+                    pil_image = element.get_image(conv_res.document)
+                    
+                    # Melhorar qualidade da imagem se necessário
+                    enhanced_image = self._enhance_image_for_ocr(pil_image)
                     
                     # Salvar imagem melhorada
-                    image_path = f"{output_dir}/{doc_filename}-page-{page_no}.png"
-                    enhanced_image.save(image_path, format="PNG", dpi=(300, 300))
+                    with element_image_filename.open("wb") as fp:
+                        enhanced_image.save(fp, "PNG", dpi=(300, 300))
                     
-                    # Processar imagem com OCR adicional se necessário
-                    image_doc = self._process_image_with_fallback_ocr(
-                        image_path, enhanced_image, file_name, sector, page_no
+                    print(f'Posição: 7 - processando imagem {picture_counter}')
+                    
+                    # Usar sua função process_image existente para gerar a descrição
+                    image_doc = self.image_processor.process_image(
+                        image_path=str(element_image_filename),
+                        source=file_name,
+                        sector=sector,
+                        page_no=picture_counter  # Usando o número da imagem como referência
                     )
                     
                     if image_doc:
+                        print('o image_doc: ', image_doc)
+                        # Converter o Document para o formato esperado pelos seus documentos
+                        image_doc.metadata.update({
+                            'filename': file_name,
+                            'upload_date': upload_date,
+                            'content_type': 'image_description',
+                            'image_path': str(element_image_filename),
+                            'image_number': picture_counter,
+                            'original_filename': f"{file_name}-picture-{picture_counter}.png"
+                        })
+
+                        # Adicionar o Document diretamente
                         documents.append(image_doc)
+                        
                         image_docs_count += 1
-                        logger.info(f"Imagem da página {page_no} processada com sucesso")
+                        logger.info(f"Imagem {picture_counter} processada e descrita com sucesso via LLM")
+
+            print(self.hora_formatada, 'Posição: 8')
 
             # Extrair e processar tabelas
             tables = data.get("tables", [])
@@ -361,19 +440,20 @@ class DocumentService:
                 documents.append(table_doc)
                 table_docs_count += 1
 
+            print(self.hora_formatada, 'Posição: 9')
+            print(self.hora_formatada, 'documents: ', documents)
             # Adicionar documentos ao repositório
             self.repository.add_documents(sector, documents)
             
             print('texto processado: ', processed_text)
 
+            print(self.hora_formatada, 'Posição: 10')
             # Preparar estatísticas para resposta
             stats = {
                 "text_docs": 1 if processed_text and processed_text.strip() else 0,
                 "image_docs": image_docs_count,
                 "table_docs": table_docs_count,
             }
-            
-            print('chegou no estagio final.')
             
             return {
                 "status": "success",
@@ -444,6 +524,8 @@ class DocumentService:
         Processa imagem com múltiplas tentativas de OCR para melhor qualidade.
         """
         try:
+
+            print('Posição: 7 (interno) - processador principal')
             # Primeiro tentar com o processador de imagem padrão
             image_doc = self.image_processor.process_image(
                 image_path, file_name, sector, page_no
@@ -453,11 +535,10 @@ class DocumentService:
             if not image_doc or len(image_doc.page_content) < 50:
                 import pytesseract
                 
-                # Configurações otimizadas do Tesseract para português
-                custom_config = r'--oem 3 --psm 6 -l por+pt'
+                print('Posição: 7 (interno) - ocr direto')
                 
                 # OCR na imagem melhorada
-                ocr_text = pytesseract.image_to_string(enhanced_image, config=custom_config)
+                ocr_text = pytesseract.image_to_string(enhanced_image, lang='por')
                 
                 if ocr_text and len(ocr_text.strip()) > 20:
                     processed_ocr_text = self._post_process_text(ocr_text)
@@ -480,7 +561,8 @@ class DocumentService:
             logger.warning(f"Erro no processamento de imagem da página {page_no}: {str(e)}")
             return None
 
-    def _post_process_text(self, text, spelling_correction='languagetool'):
+    #def _post_process_text(self, text, spelling_correction='languagetool'):
+    def _post_process_text(self, text, spelling_correction='none'):
         """
         Pós-processa o texto extraído para corrigir erros comuns de OCR.
         """
@@ -558,7 +640,7 @@ class DocumentService:
         
         spell_checker = SpellChecker(language='pt')
         
-        print('passa aqui')
+        print('passa aqui: ', words)
 
         for word in words:
             word_lower = word.lower()
@@ -570,6 +652,9 @@ class DocumentService:
                     best_correction = list(candidates)[0]
                     corrections[word] = best_correction
         
+
+        print('chega aqui')
+
         # Aplica as correções mantendo a capitalização original
         corrected_text = text
         for original, correction in corrections.items():
@@ -580,6 +665,8 @@ class DocumentService:
             
             corrected_text = re.sub(r'\b' + re.escape(original) + r'\b', 
                 correction, corrected_text)
+        
+        print('vem pra ca')
         
         return corrected_text
 

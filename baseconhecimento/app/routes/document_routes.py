@@ -1,7 +1,9 @@
 import os
+from venv import logger
 from flask import Blueprint, request, jsonify
 from app.services.document_service import DocumentService
 from werkzeug.utils import secure_filename
+from threading import Thread
 
 document_blueprint = Blueprint('document', __name__)
 document_service = DocumentService()
@@ -29,19 +31,24 @@ def upload_pdf():
     if file.filename == '':
         return jsonify({'error': 'Nenhum arquivo selecionado'}), 400
     
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        file_content = file.read()
-        
-        # Processa o PDF
-        result = document_service.process_pdf(file_content, filename, sector)
-        
-        if result["status"] == "success":
-            return jsonify(result), 200
-        else:
-            return jsonify(result), 500
-    
-    return jsonify({'error': 'Tipo de arquivo não permitido'}), 400
+    filename = secure_filename(file.filename)
+    file_content = file.read()
+
+    def async_process():
+        try:
+            result = document_service.process_pdf(file_content, filename, sector)
+            logger.info(f"Processamento finalizado: {result}")
+        except Exception as e:
+            logger.error(f"Erro no processamento assíncrono: {str(e)}")
+
+    # Inicia o processamento em background
+    Thread(target=async_process).start()
+
+    # Responde imediatamente ao usuário
+    return jsonify({
+        'status': 'accepted',
+        'message': f'O arquivo {filename} foi recebido e será processado para o setor {sector}.'
+    }), 202
 
 @document_blueprint.route('/api/documents/<sector>', methods=['GET'])
 def list_documents(sector):

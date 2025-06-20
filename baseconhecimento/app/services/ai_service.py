@@ -165,6 +165,8 @@ class AIService:
                 embedding_function=self.embeddings
             )
 
+            print('[999] dados: Setor:', f'sector_{sector}', '. sector_persist_dir:', sector_persist_dir, '. Função de embedding:', self.embeddings)
+
             # Verificar se há documentos no vectorstore
             collection_count = vectorstore._collection.count()
             if collection_count == 0:
@@ -174,7 +176,7 @@ class AIService:
             print(f"Vectorstore para setor {sector} carregado com sucesso. Documentos: {collection_count}")
 
             # Configurar retriever
-            retriever = vectorstore.as_retriever(
+            retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3}) #vectorstore.as_retriever(
                 #search_type="mmr",  # Maximal Marginal Relevance para melhor diversidade nos resultados
                 #search_kwargs={
                 #    "k": 5,  # Aumentando para 5 documentos (ajuste conforme necessário)
@@ -182,9 +184,10 @@ class AIService:
                 #    "lambda_mult": 0.7,  # Balanceamento entre relevância e diversidade
                 #    "filter": None  # Sem filtros por enquanto, mas útil para diagnóstico
                 #}
+                
                 #search_type="similarity",
-                search_kwargs={"k": 3}
-            )
+                #search_kwargs={"k": 3}
+            #)
 
             return retriever
         except Exception as e:
@@ -210,7 +213,7 @@ class AIService:
 
         try:
             # Recuperar documentos relevantes
-            docs = self.retriever.invoke(message)
+            docs = self.retriever.get_relevant_documents(message)
 
             print(f"Documentos recuperados: {len(docs)}")
             
