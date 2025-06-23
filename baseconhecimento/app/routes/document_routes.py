@@ -36,7 +36,16 @@ def upload_pdf():
 
     def async_process():
         try:
-            result = document_service.process_pdf(file_content, filename, sector)
+            typefile = filename.rsplit('.', 1)[1].lower()
+            if(typefile == 'pdf'):
+                result = document_service.process_pdf(file_content, filename, sector)
+
+            elif(typefile == 'xls' or typefile == 'xlsx'):
+                result = document_service.process_excel(file_content, filename, sector)
+
+            elif(typefile == 'doc' or typefile == 'docx'):
+                result = document_service.process_word(file_content, filename, sector)
+
             logger.info(f"Processamento finalizado: {result}")
         except Exception as e:
             logger.error(f"Erro no processamento assíncrono: {str(e)}")

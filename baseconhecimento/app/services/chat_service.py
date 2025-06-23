@@ -10,19 +10,6 @@ class ChatService:
         self.conversation_history.append(message)
         return message
 
-    def process_user_message_old(self, sector: str, content: str) -> Message:
-        # Adiciona mensagem do usuário
-        #user_message = self.add_message(content, "user")
-
-        ai_response = self.ai_service.generate_response(sector, content)
-        #ai_message = self.add_message(ai_response, "assistant")
-
-        return ai_response
-
-    def process_user_message_atual(self, sector: str, content: str) -> Message:
-        ai_response = self.ai_service.generate_response(sector, content)
-        return ai_response
-    
     def process_user_message(self, sector: str, content: str, sector_name: str,):
         """Processa a mensagem do usuário e retorna a resposta do assistente"""
         # Aqui você pode adicionar lógica para registrar a conversa em um banco de dados

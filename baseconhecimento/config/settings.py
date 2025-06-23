@@ -23,3 +23,6 @@ class Config:
     ENABLE_IMAGE_CACHE = True
     ENABLE_TEXT_CACHE = True
     MAX_CACHE_SIZE = 100
+
+    # Temperatura do modelo
+    TEMP = 0.1

@@ -19,23 +19,9 @@ def send_message():
     
     # Verificar formato da resposta
     if isinstance(response, dict) and "text" in response:
-        # Formatar imagens para resposta
-        image_urls = []
-        for img in response.get("images", []):
-            # Criar URLs relativas para as imagens
-            img_path = img["path"]
-            # Extrair o caminho relativo a partir do diretório raiz
-            rel_path = img_path.split("images/")[-1] if "images/" in img_path else img_path
-            image_urls.append({
-                "url": f"/api/images/{rel_path}",
-                "source": img.get("source", ""),
-                "page": img.get("page", ""),
-                "type": img.get("type", "")
-            })
         
         return {
             'content': response["text"].content if hasattr(response["text"], "content") else str(response["text"]),
-            'images': image_urls,
             'role': 'maquina',
             'timestamp': datetime.datetime.now().isoformat()
         }
@@ -47,23 +33,6 @@ def send_message():
             'role': 'maquina',
             'timestamp': datetime.datetime.now().isoformat()
         })
-
-# Rota para servir as imagens
-@chat_blueprint.route('/api/images/<path:image_path>', methods=['GET'])
-def get_image(image_path):
-    """Serve imagens processadas"""
-    try:
-        # Construir o caminho completo para a imagem
-        full_path = os.path.join("images", image_path)
-        
-        # Verificar se o arquivo existe
-        if not os.path.exists(full_path):
-            return jsonify({'error': 'Imagem não encontrada'}), 404
-        
-        # Servir o arquivo
-        return send_file(full_path, mimetype='image/png')
-    except Exception as e:
-        return jsonify({'error': f'Erro ao carregar imagem: {str(e)}'}), 500
 
 @chat_blueprint.route('/api/chat/history', methods=['GET'])
 def get_history():
@@ -85,8 +54,7 @@ def list_sectors():
         # Listar diretórios na pasta de persistência do ChromaDB
         persist_dir = chat_service.ai_service.persist_directory
         sectors = [d for d in os.listdir(persist_dir) if os.path.isdir(os.path.join(persist_dir, d))]
-        
-        print('setores: ', sectors);
+
         return jsonify({
             'status': 'success',
             'sectors': sectors

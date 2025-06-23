@@ -28,6 +28,8 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+from docling.backend.msword_backend import MsWordDocumentBackend
+from docling.backend.msexcel_backend import MsExcelDocumentBackend
 
 import cv2
 import numpy as np
@@ -36,14 +38,14 @@ import re
 
 from spellchecker import SpellChecker
 import language_tool_python
-from docling.datamodel.pipeline_options import PdfPipelineOptions, PaginatedPipelineOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption, ExcelFormatOption
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 
 from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice
 import torch
 os.environ['TORCH_CUDA_ARCH_LIST'] = '7.5'
-from docling_core.types.doc import ImageRefMode, PictureItem, TableItem
+from docling_core.types.doc import PictureItem
 
 # Configuração de logging
 logging.basicConfig(
@@ -81,8 +83,6 @@ class DocumentRepository:
             chunk_size=Config.CHUNK_SIZE,
             chunk_overlap=Config.CHUNK_OVERLAP
         )
-
-        print('passa por esse')
         
         # Processar documentos em paralelo para splitting
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -94,17 +94,12 @@ class DocumentRepository:
             all_split_docs = []
             for future in concurrent.futures.as_completed(split_futures):
                 all_split_docs.extend(future.result())
-        
-        print('chega nesse')
 
         # Adicionar em batches maiores
         ids = []
         batch_size = min(Config.EMBEDDING_BATCH_SIZE * 2, 100)  # Batch maior
-        
-        print('aqui tbm')
 
         for i in range(0, len(all_split_docs), batch_size):
-            print('entra no for')
             batch = all_split_docs[i:i + batch_size]
             try:
                 batch_ids = vectorstore.add_documents(batch)
@@ -118,7 +113,6 @@ class DocumentRepository:
                         ids.extend(doc_id)
                     except Exception as doc_error:
                         logger.error(f"Erro ao adicionar documento individual: {str(doc_error)}")
-        
         return ids
     
     def get_documents_by_source(self, sector: str, source: str) -> Tuple[List[Dict], List[str]]:
@@ -210,27 +204,30 @@ class ImageProcessor:
     def __init__(self, vision_model_name=Config.VISION_MODEL_NAME):
         self.vision_model = OllamaLLM(
             model=vision_model_name,
-            num_gpu=2,  # Limitar uso de GPU
-            num_thread=8  # Limitar threads de CPU
+            num_gpu=1,  # Limitar uso de GPU
+            num_thread=4  # Limitar threads de CPU
         )
         
     def process_image(self, image_path: str, source: str, sector: str, page_no: int) -> Optional[Document]:
         """Processa uma imagem e retorna um documento com a descrição da imagem"""
         try:
             image_llm = self.vision_model.bind(images=[image_path])
-            print("Imagem vinculada com vision_model. Pronto para invocar.")
 
             prompt = """
             Descreva o que você vê na imagem em português. 
             Faça de forma simples, fácil de entender e com uma linguagem muito clara. 
             Seja o mais descritivo possível, sem perder ou pular nenhum detalhe.
             Não retorne junto a descrição saudações ou cumprimentos.
+            Os dados serão utilizados para complementar documentações para futuras consultas.
             """
+
+            print('Antes de invokar.')
             
             response = image_llm.invoke(prompt)
-            print("Resposta da LLM recebida.")
 
             logger.info(f"Resultado da descrição: {response}")
+            
+            print('Resultado da descrição: ', response)
 
             return Document(
                 page_content=response,
@@ -261,7 +258,6 @@ class DocumentService:
 
         self.image_processor = ImageProcessor(vision_model_name)
 
-        # Obtém a hora atual
         self.agora = datetime.now()
 
         # Formata a hora para exibição (opcional)
@@ -272,13 +268,23 @@ class DocumentService:
         
         self.language_tool = None  # Inicializar apenas quando necessário
 
-    def _save_temp_file(self, file_content, file_name):
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, file_name)
-        
-        with open(temp_path, 'wb') as f:
-            f.write(file_content)
+    def _initialize_language_tool(self):
+        """Inicializa o LanguageTool apenas quando necessário"""
+        print('aqui inicializando')
+        if self.language_tool is None:
+            self.language_tool = language_tool_python.LanguageTool('pt-BR')
 
+    def _save_temp_file(self, pdf_file, file_name: str):
+        """Salva arquivo temporário para processamento."""
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"temp_{file_name}")
+        
+        with open(temp_path, "wb") as f:
+            if hasattr(pdf_file, 'read'):
+                f.write(pdf_file.read())
+            else:
+                f.write(pdf_file)
+        
         return temp_path
     
     def process_pdf(self, pdf_file, file_name: str, sector: str):
@@ -289,12 +295,9 @@ class DocumentService:
         pós-processamento de texto para melhor qualidade.
         """
         
-        print('Iniciando. Posição: 1')
-
         # Salva o arquivo temporariamente
         temp_path = self._save_temp_file(pdf_file, file_name)
 
-        print('Posição: 2')
         try:
             # Usar docling para processamento do PDF com configurações otimizadas
             input_doc_path = Path(temp_path)
@@ -303,8 +306,8 @@ class DocumentService:
             
             # Configuração otimizada do docling para melhor OCR
             pipeline_options = PdfPipelineOptions()
-            pipeline_options.ocr_options.lang = ["pt"]  # Português brasileiro e português
-            pipeline_options.images_scale = 2.0  # Aumentar escala para melhor OCR
+            pipeline_options.ocr_options.lang = ["pt"]
+            pipeline_options.images_scale = 2.0
             pipeline_options.generate_page_images = False
             pipeline_options.generate_picture_images = True
             accelerator_options = AcceleratorOptions(
@@ -312,7 +315,7 @@ class DocumentService:
             )
             pipeline_options.accelerator_options = accelerator_options
 
-            print(f"   CUDA available: {torch.cuda.is_available()}")
+            print(f"CUDA available: {torch.cuda.is_available()}")
 
             doc_converter = DocumentConverter(
                 format_options={
@@ -323,33 +326,26 @@ class DocumentService:
                 }
             )
             
-            print(self.hora_formatada, 'Posição: 3')
-
             # Converter o documento
             conv_res = doc_converter.convert(input_doc_path)
             data = conv_res.document.export_to_dict()
-            print(self.hora_formatada, 'Posição: 3.5')
 
             raw_text = conv_res.document.export_to_text()
 
-            print('raw_text ', raw_text)
-            print(self.hora_formatada, 'Posição: 4')
+            print('Raw_text: ', raw_text)
 
             # Pós-processamento do texto extraído
             processed_text = self._post_process_text(raw_text)
-            #processed_text = raw_text
 
-            # Normalizar e limpar o texto português
-            #text = self._normalize_portuguese_text(text)
-            #text = self._clean_extracted_text(text)
+            # Normalizar e limpar o texto português - Não utilizado por motivos de mudanças bruscas em palavras importantes que o corretor julga como erradas
+            #processed_text = self._normalize_portuguese_text(processed_text)
+            #processed_text = self._clean_extracted_text(processed_text)
             
             # Gerar um timestamp de upload para agrupar documentos
             upload_date = datetime.now().isoformat()
 
             # Preparar documentos para vetorização
             documents = []
-            
-            print(self.hora_formatada, 'Posição: 5')
 
             # Adicionar conteúdo de texto processado
             if processed_text and processed_text.strip():
@@ -371,54 +367,50 @@ class DocumentService:
             picture_counter = 0
             image_docs_count = 0
 
-            print(self.hora_formatada, 'Posição: 7 - processando imagens')
-
-            for element, _level in conv_res.document.iterate_items():
-                if isinstance(element, PictureItem):
-                    picture_counter += 1
-                    
-                    # Salvar a imagem
-                    element_image_filename = output_dir / f"{file_name}-picture-{picture_counter}.png"
-                    
-                    # Obter a imagem PIL
-                    pil_image = element.get_image(conv_res.document)
-                    
-                    # Melhorar qualidade da imagem se necessário
-                    enhanced_image = self._enhance_image_for_ocr(pil_image)
-                    
-                    # Salvar imagem melhorada
-                    with element_image_filename.open("wb") as fp:
-                        enhanced_image.save(fp, "PNG", dpi=(300, 300))
-                    
-                    print(f'Posição: 7 - processando imagem {picture_counter}')
-                    
-                    # Usar sua função process_image existente para gerar a descrição
-                    image_doc = self.image_processor.process_image(
-                        image_path=str(element_image_filename),
-                        source=file_name,
-                        sector=sector,
-                        page_no=picture_counter  # Usando o número da imagem como referência
-                    )
-                    
-                    if image_doc:
-                        print('o image_doc: ', image_doc)
-                        # Converter o Document para o formato esperado pelos seus documentos
-                        image_doc.metadata.update({
-                            'filename': file_name,
-                            'upload_date': upload_date,
-                            'content_type': 'image_description',
-                            'image_path': str(element_image_filename),
-                            'image_number': picture_counter,
-                            'original_filename': f"{file_name}-picture-{picture_counter}.png"
-                        })
-
-                        # Adicionar o Document diretamente
-                        documents.append(image_doc)
+            if 1!=1:
+                for element, _level in conv_res.document.iterate_items():
+                    if isinstance(element, PictureItem):
+                        picture_counter += 1
                         
-                        image_docs_count += 1
-                        logger.info(f"Imagem {picture_counter} processada e descrita com sucesso via LLM")
+                        # Salvar a imagem
+                        element_image_filename = output_dir / f"{file_name}-picture-{picture_counter}.png"
+                        
+                        # Obter a imagem PIL
+                        pil_image = element.get_image(conv_res.document)
+                        
+                        # Melhorar qualidade da imagem se necessário
+                        #enhanced_image = self._enhance_image_for_ocr(pil_image)
+                        enhanced_image = pil_image
 
-            print(self.hora_formatada, 'Posição: 8')
+                        # Salvar imagem melhorada
+                        with element_image_filename.open("wb") as fp:
+                            enhanced_image.save(fp, "PNG", dpi=(300, 300))
+
+                        # Usar função process_image para gerar a descrição
+                        image_doc = self.image_processor.process_image(
+                            image_path=str(element_image_filename),
+                            source=file_name,
+                            sector=sector,
+                            page_no=picture_counter  # Usando o número da imagem como referência
+                        )
+
+                        self._remove_image(str(element_image_filename))
+                        
+                        if image_doc:
+                            image_doc.metadata.update({
+                                'filename': file_name,
+                                'upload_date': upload_date,
+                                'content_type': 'image_description',
+                                'image_path': str(element_image_filename),
+                                'image_number': picture_counter,
+                                'original_filename': f"{file_name}-picture-{picture_counter}.png"
+                            })
+
+                            # Adicionar o Document diretamente
+                            documents.append(image_doc)
+                            
+                            image_docs_count += 1
+                            logger.info(f"Imagem {picture_counter} processada e descrita com sucesso via LLM")
 
             # Extrair e processar tabelas
             tables = data.get("tables", [])
@@ -447,14 +439,374 @@ class DocumentService:
                 documents.append(table_doc)
                 table_docs_count += 1
 
-            print(self.hora_formatada, 'Posição: 9')
-            print(self.hora_formatada, 'documents: ', documents)
             # Adicionar documentos ao repositório
             self.repository.add_documents(sector, documents)
             
-            print('texto processado: ', processed_text)
+            print('Texto processado: ', processed_text)
 
-            print(self.hora_formatada, 'Posição: 10')
+            # Preparar estatísticas para resposta
+            stats = {
+                "text_docs": 1 if processed_text and processed_text.strip() else 0,
+                "image_docs": image_docs_count,
+                "table_docs": table_docs_count,
+            }
+            
+            return {
+                "status": "success",
+                "message": f"PDF {file_name} processado com sucesso para o setor {sector}",
+                "document_count": len(documents),
+                "stats": stats,
+                "sector": sector
+            }
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar PDF: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Erro ao processar PDF: {str(e)}"
+            }
+        finally:
+            # Limpa o arquivo temporário
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def process_word(self, pdf_file, file_name: str, sector: str):
+        """
+        Processa um arquivo WORD com melhorias na extração de texto e qualidade do OCR.
+        
+        Inclui pré-processamento de imagens, múltiplas tentativas de OCR e 
+        pós-processamento de texto para melhor qualidade.
+        """
+
+        # Salva o arquivo temporariamente
+        temp_path = self._save_temp_file(pdf_file, file_name)
+
+        try:
+            # Usar docling para processamento do WORD com configurações otimizadas
+            input_doc_path = Path(temp_path)
+            output_dir = Path(f"./images/{sector}")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Configuração otimizada do docling para melhor OCR
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.ocr_options.lang = ["pt"]
+            pipeline_options.images_scale = 2.0
+            pipeline_options.generate_page_images = False
+            pipeline_options.generate_picture_images = True
+            accelerator_options = AcceleratorOptions(
+                num_threads=8, device=AcceleratorDevice.CUDA
+            )
+            pipeline_options.accelerator_options = accelerator_options
+
+            print(f"CUDA available: {torch.cuda.is_available()}")
+
+            doc_converter = DocumentConverter(
+                format_options={
+                    InputFormat.DOCX: WordFormatOption(
+                        pipeline_options=pipeline_options,
+                        backend=MsWordDocumentBackend,
+                    )
+                }
+            )
+
+            # Converter o documento
+            conv_res = doc_converter.convert(input_doc_path)
+            data = conv_res.document.export_to_dict()
+
+            raw_text = conv_res.document.export_to_text()
+
+            print('Raw_text ', raw_text)
+
+            # Pós-processamento do texto extraído
+            processed_text = self._post_process_text(raw_text)
+
+            # Normalizar e limpar o texto português
+            processed_text = self._normalize_portuguese_text(processed_text)
+            processed_text = self._clean_extracted_text(processed_text)
+            
+            # Gerar um timestamp de upload para agrupar documentos
+            upload_date = datetime.now().isoformat()
+
+            # Preparar documentos para vetorização
+            documents = []
+
+            # Adicionar conteúdo de texto processado
+            if processed_text and processed_text.strip():
+                text_doc = Document(
+                    page_content=processed_text,
+                    metadata={
+                        "source": file_name,
+                        "sector": sector,
+                        "type": "text-content",
+                        "format": "pdf",
+                        "upload_date": upload_date,
+                        "processing_quality": "enhanced"
+                    }
+                )
+                documents.append(text_doc)
+                print(f"Texto processado extraído: {len(processed_text)} caracteres")
+
+            # Processar apenas as imagens extraídas
+            picture_counter = 0
+            image_docs_count = 0
+
+            for element, _level in conv_res.document.iterate_items():
+                if isinstance(element, PictureItem):
+                    picture_counter += 1
+                    
+                    # Salvar a imagem
+                    element_image_filename = output_dir / f"{file_name}-picture-{picture_counter}.png"
+                    
+                    # Obter a imagem PIL
+                    pil_image = element.get_image(conv_res.document)
+                    
+                    # Melhorar qualidade da imagem se necessário
+                    #enhanced_image = self._enhance_image_for_ocr(pil_image)
+                    enhanced_image = pil_image
+
+                    # Salvar imagem melhorada
+                    with element_image_filename.open("wb") as fp:
+                        enhanced_image.save(fp, "PNG", dpi=(300, 300))
+                    
+                    # Usar função process_image para gerar a descrição
+                    image_doc = self.image_processor.process_image(
+                        image_path=str(element_image_filename),
+                        source=file_name,
+                        sector=sector,
+                        page_no=picture_counter  # Usando o número da imagem como referência
+                    )
+                    
+                    self._remove_image(str(element_image_filename))
+
+                    if image_doc:
+                        image_doc.metadata.update({
+                            'filename': file_name,
+                            'upload_date': upload_date,
+                            'content_type': 'image_description',
+                            'image_path': str(element_image_filename),
+                            'image_number': picture_counter,
+                            'original_filename': f"{file_name}-picture-{picture_counter}.png"
+                        })
+
+                        # Adicionar o Document diretamente
+                        documents.append(image_doc)
+                        
+                        image_docs_count += 1
+                        logger.info(f"Imagem {picture_counter} processada e descrita com sucesso via LLM")
+
+            # Extrair e processar tabelas
+            tables = data.get("tables", [])
+            table_docs_count = 0
+
+            for i, table in enumerate(tables):
+                table_content = str(table.get("content", ""))
+                if not table_content.strip():
+                    continue
+
+                # Processar conteúdo da tabela
+                processed_table_content = self._post_process_text(table_content)
+
+                table_doc = Document(
+                    page_content=processed_table_content,
+                    metadata={
+                        "source": file_name,
+                        "sector": sector,
+                        "type": "table-content",
+                        "table_index": i,
+                        "format": "text/table",
+                        "upload_date": upload_date,
+                        "processing_quality": "enhanced"
+                    }
+                )
+                documents.append(table_doc)
+                table_docs_count += 1
+
+            # Adicionar documentos ao repositório
+            self.repository.add_documents(sector, documents)
+            
+            print('Texto processado: ', processed_text)
+
+            # Preparar estatísticas para resposta
+            stats = {
+                "text_docs": 1 if processed_text and processed_text.strip() else 0,
+                "image_docs": image_docs_count,
+                "table_docs": table_docs_count,
+            }
+            
+            return {
+                "status": "success",
+                "message": f"PDF {file_name} processado com sucesso para o setor {sector}",
+                "document_count": len(documents),
+                "stats": stats,
+                "sector": sector
+            }
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar PDF: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Erro ao processar PDF: {str(e)}"
+            }
+        finally:
+            # Limpa o arquivo temporário
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def process_excel(self, pdf_file, file_name: str, sector: str):
+        """
+        Processa um arquivo EXCEL com melhorias na extração de texto e qualidade do OCR.
+        
+        Inclui pré-processamento de imagens, múltiplas tentativas de OCR e 
+        pós-processamento de texto para melhor qualidade.
+        """
+
+        # Salva o arquivo temporariamente
+        temp_path = self._save_temp_file(pdf_file, file_name)
+
+        try:
+            # Usar docling para processamento do WORD com configurações otimizadas
+            input_doc_path = Path(temp_path)
+            output_dir = Path(f"./images/{sector}")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Configuração otimizada do docling para melhor OCR
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.ocr_options.lang = ["pt"]
+            pipeline_options.images_scale = 2.0
+            pipeline_options.generate_page_images = False
+            pipeline_options.generate_picture_images = True
+            accelerator_options = AcceleratorOptions(
+                num_threads=8, device=AcceleratorDevice.CUDA
+            )
+            pipeline_options.accelerator_options = accelerator_options
+
+            print(f"CUDA available: {torch.cuda.is_available()}")
+
+            doc_converter = DocumentConverter(
+                format_options={
+                    InputFormat.XLSX: ExcelFormatOption(
+                        pipeline_options=pipeline_options,
+                        backend=MsExcelDocumentBackend,
+                    )
+                }
+            )
+
+            # Converter o documento
+            conv_res = doc_converter.convert(input_doc_path)
+            data = conv_res.document.export_to_dict()
+            raw_text = conv_res.document.export_to_text()
+
+            print('Raw_text: ', raw_text)
+
+            # Pós-processamento do texto extraído
+            processed_text = self._post_process_text(raw_text)
+
+            # Normalizar e limpar o texto português
+            processed_text = self._normalize_portuguese_text(processed_text)
+            processed_text = self._clean_extracted_text(processed_text)
+            
+            # Gerar um timestamp de upload para agrupar documentos
+            upload_date = datetime.now().isoformat()
+
+            # Preparar documentos para vetorização
+            documents = []
+
+            # Adicionar conteúdo de texto processado
+            if processed_text and processed_text.strip():
+                text_doc = Document(
+                    page_content=processed_text,
+                    metadata={
+                        "source": file_name,
+                        "sector": sector,
+                        "type": "text-content",
+                        "format": "pdf",
+                        "upload_date": upload_date,
+                        "processing_quality": "enhanced"
+                    }
+                )
+                documents.append(text_doc)
+                print(f"Texto processado extraído: {len(processed_text)} caracteres")
+
+            # Processar apenas as imagens extraídas
+            picture_counter = 0
+            image_docs_count = 0
+
+            for element, _level in conv_res.document.iterate_items():
+                if isinstance(element, PictureItem):
+                    picture_counter += 1
+                    
+                    # Salvar a imagem
+                    element_image_filename = output_dir / f"{file_name}-picture-{picture_counter}.png"
+                    
+                    # Obter a imagem PIL
+                    pil_image = element.get_image(conv_res.document)
+                    
+                    # Melhorar qualidade da imagem se necessário
+                    #enhanced_image = self._enhance_image_for_ocr(pil_image)
+                    enhanced_image = pil_image
+                    
+                    # Salvar imagem melhorada
+                    with element_image_filename.open("wb") as fp:
+                        enhanced_image.save(fp, "PNG", dpi=(300, 300))
+
+                    # Usar função process_image para gerar a descrição
+                    image_doc = self.image_processor.process_image(
+                        image_path=str(element_image_filename),
+                        source=file_name,
+                        sector=sector,
+                        page_no=picture_counter  # Usando o número da imagem como referência
+                    )
+
+                    self._remove_image(str(element_image_filename))
+                    
+                    if image_doc:
+                        image_doc.metadata.update({
+                            'filename': file_name,
+                            'upload_date': upload_date,
+                            'content_type': 'image_description',
+                            'image_path': str(element_image_filename),
+                            'image_number': picture_counter,
+                            'original_filename': f"{file_name}-picture-{picture_counter}.png"
+                        })
+
+                        # Adicionar o Document diretamente
+                        documents.append(image_doc)
+                        
+                        image_docs_count += 1
+                        logger.info(f"Imagem {picture_counter} processada e descrita com sucesso via LLM")
+
+            # Extrair e processar tabelas
+            tables = data.get("tables", [])
+            table_docs_count = 0
+
+            for i, table in enumerate(tables):
+                table_content = str(table.get("content", ""))
+                if not table_content.strip():
+                    continue
+
+                # Processar conteúdo da tabela
+                processed_table_content = self._post_process_text(table_content)
+
+                table_doc = Document(
+                    page_content=processed_table_content,
+                    metadata={
+                        "source": file_name,
+                        "sector": sector,
+                        "type": "table-content",
+                        "table_index": i,
+                        "format": "text/table",
+                        "upload_date": upload_date,
+                        "processing_quality": "enhanced"
+                    }
+                )
+                documents.append(table_doc)
+                table_docs_count += 1
+
+            # Adicionar documentos ao repositório
+            self.repository.add_documents(sector, documents)
+            
+            print('Texto processado: ', processed_text)
+
             # Preparar estatísticas para resposta
             stats = {
                 "text_docs": 1 if processed_text and processed_text.strip() else 0,
@@ -523,16 +875,25 @@ class DocumentService:
         
         # Aplicar sharpening
         enhanced_pil = enhanced_pil.filter(ImageFilter.SHARPEN)
-        
+
         return enhanced_pil
 
+    def _remove_image(self, image_path):
+        """
+        Remove a imagem do diretório especificado.
+        """
+        try:
+            os.remove(image_path)
+            print(f"Arquivo '{image_path}' deletado com sucesso.")
+
+        except FileNotFoundError: print(f"Arquivo '{image_path}' não encontrado.")
+
+    # não usada
     def _process_image_with_fallback_ocr(self, image_path, enhanced_image, file_name, sector, page_no):
         """
         Processa imagem com múltiplas tentativas de OCR para melhor qualidade.
         """
         try:
-
-            print('Posição: 7 (interno) - processador principal')
             # Primeiro tentar com o processador de imagem padrão
             image_doc = self.image_processor.process_image(
                 image_path, file_name, sector, page_no
@@ -541,8 +902,6 @@ class DocumentService:
             # Se o resultado for muito curto ou com muitos erros, tentar OCR direto
             if not image_doc or len(image_doc.page_content) < 50:
                 import pytesseract
-                
-                print('Posição: 7 (interno) - ocr direto')
                 
                 # OCR na imagem melhorada
                 ocr_text = pytesseract.image_to_string(enhanced_image, lang='por')
@@ -611,15 +970,7 @@ class DocumentService:
         
         return '\n'.join(filtered_lines).strip()
 
-    def _initialize_language_tool(self):
-        """Inicializa o LanguageTool apenas quando necessário"""
-        print('aqui inicializando')
-        if self.language_tool is None:
-            self.language_tool = language_tool_python.LanguageTool('pt-BR')
-
     def _correct_with_context(self, text, method='languagetool'):
-        print('O motodo é: ', method)
-
         """Correção com diferentes níveis de contexto"""
         if method == 'simple':
             return self._correct_spelling_simple(text)
@@ -630,9 +981,8 @@ class DocumentService:
                 language_tool = language_tool_python.LanguageTool('pt-BR')
                 #matches = self.language_tool.check(text)
                 matches = language_tool.check(text)
-                print('Matches: ', matches)
                 correcao = language_tool_python.utils.correct(text, matches)
-                print('A correcao: ', correcao)
+
                 return correcao
             except Exception as e:
                 print('O erro: ', e)
@@ -677,34 +1027,18 @@ class DocumentService:
         
         return corrected_text
 
-    def _save_temp_file(self, pdf_file, file_name: str):
-        """
-        Salva arquivo temporário para processamento.
-        """
-        import tempfile
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"temp_{file_name}")
-        
-        with open(temp_path, "wb") as f:
-            if hasattr(pdf_file, 'read'):
-                f.write(pdf_file.read())
-            else:
-                f.write(pdf_file)
-        
-        return temp_path
-
     def list_documents(self, sector: str):
         """Lista documentos únicos do setor (agrupados por arquivo)"""
         try:
             unique_docs = self.repository.list_unique_sources(sector)
             
-            return jsonify(unique_docs), 200
-
             """return jsonify({
                 "status": "success", 
                 "count": len(unique_docs),
                 "documents": unique_docs
             }), 200"""
+
+            return jsonify(unique_docs), 200            
             
         except Exception as e:
             logger.error(f"Erro ao listar documentos: {str(e)}")
